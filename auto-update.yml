@@ -1,0 +1,206 @@
+name: Auto Update Auto Company Data
+
+on:
+  # 定时触发：北京时间凌晨2点（UTC 18:00）
+  schedule:
+    - cron: '0 18 * * *'
+  
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      year:
+        description: 'Year to collect (e.g. 2025)'
+        required: false
+        default: '2025'
+      collect_financial:
+        description: 'Collect financial data?'
+        type: boolean
+        default: true
+      collect_recruitment:
+        description: 'Collect recruitment data?'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  # ========== Job 1: 采集数据 ==========
+  collect-data:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 📦 Install dependencies
+        run: |
+          pip install -r scripts/requirements.txt
+
+      - name: 💰 Collect Financial Data
+        if: ${{ inputs.collect_financial != false }}
+        env:
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+        run: |
+          YEAR=${{ inputs.year || '2025' }}
+          echo "📅 Collecting financial data for year: $YEAR"
+          cd scripts
+          python main.py financial --year $YEAR --source akshare || echo "⚠️ AKShare collection completed with warnings"
+
+          # If Tushare token is available, also collect via Tushare for cross-validation
+          if [ -n "$TUSHARE_TOKEN" ]; then
+            echo "🔑 Tushare token found, collecting supplementary data..."
+            python main.py financial --year $YEAR --source tushare --token "$TUSHARE_TOKEN" || echo "⚠️ Tushare collection completed with warnings"
+          fi
+
+      - name: 💼 Collect Recruitment Data
+        if: ${{ inputs.collect_recruitment != false }}
+        run: |
+          echo "🔍 Collecting recruitment data from official career sites..."
+          cd scripts
+          python main.py recruitment --platform official || echo "⚠️ Recruitment collection completed with warnings"
+
+      - name: 📊 Generate Data Summary
+        run: |
+          cd scripts
+          python -c "
+          import os, json, pandas as pd
+          from datetime import datetime
+
+          summary = {
+            'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'financial_files': [],
+            'recruitment_files': [],
+            'enterprise_files': [],
+          }
+
+          for subdir in ['financial', 'recruitment', 'enterprise']:
+            path = os.path.join('../data', subdir)
+            if os.path.exists(path):
+              files = [f for f in os.listdir(path) if not f.startswith('.')]
+              summary[f'{subdir}_files'] = files
+              summary[f'{subdir}_count'] = len(files)
+
+          with open('../data/update_summary.json', 'w', encoding='utf-8') as f:
+            json.dump(summary, f, ensure_ascii=False, indent=2)
+
+          print('✅ Data summary generated')
+          "
+
+      - name: 📤 Upload data artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: collected-data
+          path: data/
+          retention-days: 30
+
+      - name: 💾 Commit collected data
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          git add data/ || true
+          git diff --staged --quiet || git commit -m "📊 Auto update data - $(date +%Y-%m-%d)"
+          git push
+
+  # ========== Job 2: 构建 GitHub Pages ==========
+  build-pages:
+    needs: collect-data
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 📥 Download collected data
+        uses: actions/download-artifact@v4
+        with:
+          name: collected-data
+          path: data/
+
+      - name: 🔧 Prepare Pages data
+        run: |
+          # Copy data files to docs/data/ for web access
+          mkdir -p docs/data
+
+          # Copy CSV files
+          if [ -d "data/financial" ]; then
+            cp data/financial/*.csv docs/data/ 2>/dev/null || true
+          fi
+          if [ -d "data/recruitment" ]; then
+            cp data/recruitment/*.csv docs/data/ 2>/dev/null || true
+          fi
+
+          # Copy company list
+          cp 全国车企清单.csv docs/data/company_list.csv 2>/dev/null || true
+
+          # Generate summary JSON for web dashboard
+          if [ -f "data/update_summary.json" ]; then
+            cp data/update_summary.json docs/data/
+          fi
+
+          # Generate recruitment stats JSON
+          python3 -c "
+          import os, json, pandas as pd
+          from datetime import datetime
+
+          stats = {
+            'last_update': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'companies': [],
+          }
+
+          # Read company list
+          try:
+            df = pd.read_csv('全国车企清单.csv')
+            stats['total_companies'] = len(df)
+            for _, row in df.iterrows():
+              stats['companies'].append({
+                'name': row.get('企业名称', ''),
+                'category': row.get('类别', ''),
+                'listed': row.get('是否上市', '') == '是',
+                'location': row.get('总部所在地', ''),
+              })
+          except Exception as e:
+            print(f'Warning: {e}')
+
+          # Read recruitment data
+          rec_dir = 'data/recruitment'
+          if os.path.exists(rec_dir):
+            total_jobs = 0
+            for f in os.listdir(rec_dir):
+              if f.endswith('.csv'):
+                try:
+                  df = pd.read_csv(os.path.join(rec_dir, f))
+                  total_jobs += len(df)
+                except:
+                  pass
+            stats['total_jobs'] = total_jobs
+
+          with open('docs/data/dashboard_data.json', 'w', encoding='utf-8') as f:
+            json.dump(stats, f, ensure_ascii=False, indent=2)
+          print('✅ Dashboard data generated')
+          "
+
+      - name: 🔨 Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: 📦 Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/
+
+      - name: 🚀 Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
